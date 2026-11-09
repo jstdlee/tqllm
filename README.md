@@ -14,6 +14,94 @@ with an OpenAI-compatible HTTP server.
 
 [Quick start](docs/guides/quickstart.md) | [Documentation](docs/README.md) | [Benchmarks](docs/BENCHMARKS.md) | [Credits](docs/CREDITS.md)
 
+## TL;DR
+
+- **One GPU, one Docker image, OpenAI-compatible API** (`:8086/v1`). Best files tested here: `Qwen3.8-27B-TQ_L.gguf` +
+  the DFlash2 drafter for dense, and the Flash-Next `mixed/` `.tqfn` set for the 125B MoE (6B active).
+- The **Flash-Next `mixed/` file is the fastest Flash-Next route**: 122 tok/s on a DGX Spark decode vs 73 tok/s for
+  TensorFold 1.2.2 on the same box (the authors' own comparison, `YTan2000/Qwen3.8-Flash-Next-tqLLM`).
+- **Agents live and die on the prompt cache, not on decode.** Re-sending a 60–85K-token session every turn with
+  `--np 1` = 34–50 s of re-prefill before the first token. Fix: `--np 2 --prompt-cache on` (see Field notes below).
+- Everything below was measured on a GB10 (DGX Spark, 121 GiB usable) with tqLLM 1.4.4.
+
+## Additional remarks: the Flash-Next prompt-cache coupling (measured 2026-11-13)
+
+`docs` lists `--prompt-cache on|off` ("keep the previous turn's KV for follow-ups, **one slot**"), but on Flash-Next it
+only engages **with `--np > 1`**: each *slot* keeps its own conversation, an incoming request routes to the slot that
+already holds most of its prompt, and only the new tail is prefilled. At the default `--np 1` **the cache
+never fires**, even for byte-identical consecutive prompts. The `np > 1` requirement lives only in CHANGELOG.md
+(`Prompt cache across request slots (Flash-Next, --prompt-cache on with --np > 1)`), so it is easy to miss.
+
+Measured on one GB10 with `--context 524288 --np 2 --prompt-cache on` (256K per slot) and a real agent session
+(85,662-token context re-sent every turn):
+
+| setting | first token | prefill of the repeated 85K context |
+|---|---:|---:|
+| `--np 1` (cache off) | 40–50 s | full 45–50 s every turn |
+| `--np 2 --prompt-cache on` | **1.0–1.4 s** | **1.3 s** — engine log: `prompt cache: 84955 of 85662 prompt tokens reused` (707 new tokens computed) |
+
+Gotchas found the hard way:
+
+1. The monitor's per-request `prefill_cached_tokens` field still reports `0` in 1.4.4 even on hits — trust the engine
+   log line `prompt cache: N of M prompt tokens reused`, or `GET /api/monitor/v1/snapshot` prefill times.
+2. Request-level `max_tokens` is clamped by the server's `--max-tokens`; requests asking for more silently stop
+   at the server cap (`finish_reason: "length"` mid-thinking). Size `--max-tokens` for think + answer.
+3. With `--prompt-cache on`, `--exact` no longer guarantees byte-identical output on a reused prefix (the server
+   warns at start). Greedy outputs still drift slightly run-to-run on Flash-Next even without it.
+4. Per-layer CUDA-graph capture failure lines on GB10 (`fn_runtime.hpp:229`) are benign fallbacks, not a failure.
+5. Flash-Next does **not** stop thinking on hard prompts at `temperature 0` — it can produce 16K+ tokens of
+   reasoning and never reach the answer. Budget accordingly or use easier probes for spot-checks.
+
+## Cooking recipes (GB10 / DGX Spark, 121 GiB)
+
+Recipe 1 — **Qwen3.8-27B, thinking medium, 32K ctx** (TQ_L 14.7 GB + DFlash2 drafter):
+
+```sh
+docker run -d --rm --gpus all -p 127.0.0.1:8086:8086 -v "$PWD/models/27b:/models:ro" \
+  --entrypoint tqserve ytan2000/tqllm:1.4.4 \
+  --model /models/Qwen3.8-27B-TQ_L.gguf -md /models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf \
+  --draft-vocab /models/mtp-vocab/atx_65536.txt \
+  --context 32768 --reasoning on --reasoning-effort medium --max-tokens 16384 \
+  --host 0.0.0.0 --port 8086
+```
+
+Decode **64–65 tok/s** greedy with thinking (draft acceptance 53.6 %), prefill ~620 tok/s, deterministic output,
+zero fit degradations. `--reasoning-effort medium` is the "thinking medium" knob.
+
+Recipe 2 — **Flash-Next single-user at 256K ctx** (mixed tqfn set: 2 shards 82.4 GB + MTP drafter 1.46 GB):
+
+```sh
+docker run -d --rm --gpus all -p 127.0.0.1:8086:8086 -v "$PWD/models/flashnext:/fn:ro" \
+  --entrypoint tqserve ytan2000/tqllm:1.4.4 \
+  --model /fn/flashnext-tqllm.tqfn --tokenizer /fn/flashnext-tokenizer.gguf \
+  --context 262144 --reasoning on --reasoning-effort medium --max-tokens 16384 \
+  --host 0.0.0.0 --port 8086
+```
+
+All 512 experts resident (~77 GB), `fit: ""` (no KV downgrade), ~60 Gi still free; decode 58–88 tok/s greedy,
+up to ~70 tok/s at 32K ctx, sample-to-sample drift on hard prompts. Avoid the 118 GB `TQ3_4S` file here
+(no room for buffers) and don't bother with the public IQ3_S file (same size, slower).
+
+Recipe 3 — **Flash-Next agent mode (the one that matters daily)**: two shared slots with 256K each and the
+prompt cache on; this is the recipe that made a 20–35× first-token improvement:
+
+```sh
+docker run -d --rm --gpus all -p 192.168.x.y:8086:8086 -v "$PWD/models/flashnext:/fn:ro" \
+  --entrypoint tqserve ytan2000/tqllm:1.4.4 \
+  --model /fn/flashnext-tqllm.tqfn --tokenizer /fn/flashnext-tokenizer.gguf \
+  --context 524288 --np 2 --prompt-cache on \
+  --reasoning on --reasoning-effort medium --max-tokens 16384 \
+  --host 0.0.0.0 --port 8086
+```
+
+Tips: publish the port on the host's *specific* LAN IP (`-p <host-lan-ip>:8086:8086`) rather than 0.0.0.0, keep
+`--max-tokens 16384` so thinking + answer both fit, and stay under **one long session per slot** — a third concurrent
+session evicts a slot's cache. Decode at ~85K cached context: 57–66 tok/s.
+
+*( measured with the server's own per-request `timings` fields; scripts: see this fork's root `serve-27b.sh`,
+`serve-flashnext.sh`, `bench.py`. )*
+
+
 **New in [1.4.4](https://github.com/turbo-tan/tqllm/releases/tag/v1.4.4)** (same machine, same session for every comparison):
 
 - **DGX Spark, Qwen3.8-27B:** prompts up to 1.42x faster than TensorFold 1.2.3 in its own record setup (8 slots x 131,072),
